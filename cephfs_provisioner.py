@@ -7,6 +7,8 @@ except ImportError as e:
     ceph_volume_client = None
     ceph_module_found = False
 
+VOlUME_GROUP="kubernetes"
+CONF_PATH="/etc/ceph/"
 
 class CephFSNativeDriver(object):
     """Driver for the Ceph Filesystem.
@@ -23,7 +25,7 @@ class CephFSNativeDriver(object):
         """ Create conf using monitors 
         Create a minimal ceph conf with monitors and cephx
         """
-        conf_path = "/tmp/ceph/" + cluster_name + ".conf"
+        conf_path = CONF_PATH + cluster_name + ".conf"
         conf = open(conf_path, 'w')
         conf.write("[global]\n")
         conf.write("mon_host = " + mons + "\n")
@@ -34,13 +36,13 @@ class CephFSNativeDriver(object):
     def _create_keyring(self, cluster_name, id, key):
         """ Create client keyring using id and key
         """
-        keyring = open("/tmp/ceph/" + cluster_name + "." + "client." + id + ".keyring", 'w')
+        keyring = open(CONF_PATH + cluster_name + "." + "client." + id + ".keyring", 'w')
         keyring.write("[client." + id + "]\n")
         keyring.write("key = " + key  + "\n")
         keyring.write("caps mds = \"allow *\"\n")
         keyring.write("caps mon = \"allow *\"\n")
         keyring.write("caps osd = \"allow *\"\n")
-
+        keyring.close()
 
     @property
     def volume_client(self):
@@ -80,14 +82,14 @@ class CephFSNativeDriver(object):
 
         return self._volume_client
 
-    def create_share(self, path, size, data_isolated):
+    def create_share(self, path, size, data_isolated, user_id):
         """Create a CephFS volume.
         """
-
+        volume_path = ceph_volume_client.VolumePath(VOlUME_GROUP, path)
 
         # Create the CephFS volume
         volume = self.volume_client.create_volume(
-            path, size=size, data_isolated=data_isolated)
+            volume_path, size=size, data_isolated=data_isolated)
 
         # To mount this you need to know the mon IPs and the path to the volume
         mon_addrs = self.volume_client.get_mon_addrs()
@@ -96,14 +98,19 @@ class CephFSNativeDriver(object):
             addrs=",".join(mon_addrs),
             path=volume['mount_path'])
 
+        """TODO
+        restrict to user_id
+        """
+
         return {
-            'path': export_location,
+            'path': export_location
         }
 
 
-    def delete_share(self, path):
-        self.volume_client.delete_volume(path, data_isolated=data_isolated)
-        self.volume_client.purge_volume(path, data_isolated=data_isolated)
+    def delete_share(self, path, data_isolated):
+        volume_path = ceph_volume_client.VolumePath(VOlUME_GROUP, path)
+        self.volume_client.delete_volume(volume_path, data_isolated=data_isolated)
+        self.volume_client.purge_volume(volume_path, data_isolated=data_isolated)
 
 
     def __del__(self):
@@ -111,5 +118,9 @@ class CephFSNativeDriver(object):
             self._volume_client.disconnect()
             self._volume_client = None
 
+"""
+RUN: CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQDuMX5YM/bHOBAAo0vAeJbyx1acKkvd3LLgiQ== python cephfs_provisioner.py
+"""
 cephfs = CephFSNativeDriver()
-cephfs.create_share("test1", 10, True)
+print cephfs.create_share("test1", 10, True, "foo")
+cephfs.delete_share("test1", True)
