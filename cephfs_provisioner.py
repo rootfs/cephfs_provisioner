@@ -1,4 +1,5 @@
 import os
+import rados
 
 try:
     import ceph_volume_client
@@ -82,14 +83,105 @@ class CephFSNativeDriver(object):
 
         return self._volume_client
 
-    def create_share(self, path, size, data_isolated, user_id):
+    def _authorize_ceph(self, volume_path, auth_id, readonly):
+        path = self._volume_client._get_path(volume_path)
+
+        # First I need to work out what the data pool is for this share:
+        # read the layout
+        pool_name = self._volume_client._get_ancestor_xattr(path, "ceph.dir.layout.pool")
+        namespace = self._volume_client.fs.getxattr(path, "ceph.dir.layout.pool_namespace")
+
+        # Now construct auth capabilities that give the guest just enough
+        # permissions to access the share
+        client_entity = "client.{0}".format(auth_id)
+        want_access_level = 'r' if readonly else 'rw'
+        want_mds_cap = 'allow r,allow {0} path={1}'.format(want_access_level, path)
+        want_osd_cap = 'allow {0} pool={1} namespace={2}'.format(
+            want_access_level, pool_name, namespace)
+
+        try:
+            existing = self._volume_client._rados_command(
+                'auth get',
+                {
+                    'entity': client_entity
+                }
+            )
+            # FIXME: rados raising Error instead of ObjectNotFound in auth get failure
+        except rados.Error:
+            caps = self._volume_client._rados_command(
+                'auth get-or-create',
+                {
+                    'entity': client_entity,
+                    'caps': [
+                        'mds', want_mds_cap,
+                        'osd', want_osd_cap,
+                        'mon', 'allow r']
+                })
+        else:
+            # entity exists, update it
+            cap = existing[0]
+
+            # Construct auth caps that if present might conflict with the desired
+            # auth caps.
+            unwanted_access_level = 'r' if want_access_level is 'rw' else 'rw'
+            unwanted_mds_cap = 'allow {0} path={1}'.format(unwanted_access_level, path)
+            unwanted_osd_cap = 'allow {0} pool={1} namespace={2}'.format(
+                unwanted_access_level, pool_name, namespace)
+
+            def cap_update(orig, want, unwanted):
+                # Updates the existing auth caps such that there is a single
+                # occurrence of wanted auth caps and no occurrence of
+                # conflicting auth caps.
+
+                cap_tokens = set(orig.split(","))
+
+                cap_tokens.discard(unwanted)
+                cap_tokens.add(want)
+
+                return ",".join(cap_tokens)
+
+            osd_cap_str = cap_update(cap['caps'].get('osd', ""), want_osd_cap, unwanted_osd_cap)
+            mds_cap_str = cap_update(cap['caps'].get('mds', ""), want_mds_cap, unwanted_mds_cap)
+
+            caps = self._volume_client._rados_command(
+                'auth caps',
+                {
+                    'entity': client_entity,
+                    'caps': [
+                        'mds', mds_cap_str,
+                        'osd', osd_cap_str,
+                        'mon', cap['caps'].get('mon')]
+                })
+            caps = self._volume_client._rados_command(
+                'auth get',
+                {
+                    'entity': client_entity
+                }
+            )
+
+        # Result expected like this:
+        # [
+        #     {
+        #         "entity": "client.foobar",
+        #         "key": "AQBY0\/pViX\/wBBAAUpPs9swy7rey1qPhzmDVGQ==",
+        #         "caps": {
+        #             "mds": "allow *",
+        #             "mon": "allow *"
+        #         }
+        #     }
+        # ]
+        assert len(caps) == 1
+        assert caps[0]['entity'] == client_entity
+        return caps[0]['key']
+
+
+    def create_share(self, path, user_id, size=None):
         """Create a CephFS volume.
         """
         volume_path = ceph_volume_client.VolumePath(VOlUME_GROUP, path)
 
         # Create the CephFS volume
-        volume = self.volume_client.create_volume(
-            volume_path, size=size, data_isolated=data_isolated)
+        volume = self.volume_client.create_volume(volume_path, size=size)
 
         # To mount this you need to know the mon IPs and the path to the volume
         mon_addrs = self.volume_client.get_mon_addrs()
@@ -101,17 +193,19 @@ class CephFSNativeDriver(object):
         """TODO
         restrict to user_id
         """
-
+        auth_result = self._authorize_ceph(volume_path, user_id, False)
         return {
-            'path': export_location
+            'path': export_location,
+            'user': user_id,
+            'auth': auth_result
         }
 
 
-    def delete_share(self, path, data_isolated):
+    def delete_share(self, path, user_id):
         volume_path = ceph_volume_client.VolumePath(VOlUME_GROUP, path)
-        self.volume_client.delete_volume(volume_path, data_isolated=data_isolated)
-        self.volume_client.purge_volume(volume_path, data_isolated=data_isolated)
-
+        self.volume_client._deauthorize(volume_path, user_id)
+        self.volume_client.delete_volume(volume_path)
+        self.volume_client.purge_volume(volume_path)
 
     def __del__(self):
         if self._volume_client:
@@ -119,8 +213,10 @@ class CephFSNativeDriver(object):
             self._volume_client = None
 
 """
-RUN: CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQDuMX5YM/bHOBAAo0vAeJbyx1acKkvd3LLgiQ== python cephfs_provisioner.py
-"""
+TEST:
 cephfs = CephFSNativeDriver()
-print cephfs.create_share("test1", 10, True, "foo")
-cephfs.delete_share("test1", True)
+print cephfs.create_share("test", "bar")
+cephfs.delete_share("test", "bar")
+RUN: 
+CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQDuMX5YM/bHOBAAo0vAeJbyx1acKkvd3LLgiQ== python cephfs_provisioner.py
+"""
