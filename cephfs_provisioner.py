@@ -1,6 +1,12 @@
 import os
 import rados
+import getopt
+import sys
+import json
 
+"""
+CEPH_CLUSTER_NAME=test CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQCMpH9YM4Q1BhAAXGNQyyOne8ZsXqWGon/dIQ== cephfs_provisioner.py -n foo -u bar
+"""
 try:
     import ceph_volume_client
     ceph_module_found = True
@@ -172,7 +178,7 @@ class CephFSNativeDriver(object):
         # ]
         assert len(caps) == 1
         assert caps[0]['entity'] == client_entity
-        return caps[0]['key']
+        return caps[0]
 
 
     def create_share(self, path, user_id, size=None):
@@ -194,11 +200,12 @@ class CephFSNativeDriver(object):
         restrict to user_id
         """
         auth_result = self._authorize_ceph(volume_path, user_id, False)
-        return {
+        ret = {
             'path': export_location,
-            'user': user_id,
-            'auth': auth_result
+            'user': auth_result['entity'],
+            'auth': auth_result['key']
         }
+        return json.dumps(ret)
 
 
     def delete_share(self, path, user_id):
@@ -212,11 +219,34 @@ class CephFSNativeDriver(object):
             self._volume_client.disconnect()
             self._volume_client = None
 
-"""
-TEST:
-cephfs = CephFSNativeDriver()
-print cephfs.create_share("test", "bar")
-cephfs.delete_share("test", "bar")
-RUN: 
-CEPH_MON=172.24.0.4 CEPH_AUTH_ID=admin CEPH_AUTH_KEY=AQDuMX5YM/bHOBAAo0vAeJbyx1acKkvd3LLgiQ== python cephfs_provisioner.py
-"""
+def main():
+    create = True
+    share = ""
+    user = ""
+    cephfs = CephFSNativeDriver()
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "rn:u:", ["remove"])
+    except getopt.GetoptError:
+        print "Usage: " + sys.argv[0] + " --remove -n share_name -u ceph_user_id"
+        sys.exit(1)
+
+    for opt, arg in opts:
+        if opt == '-n':
+            share = arg
+        elif opt == '-u':
+            user = arg
+        elif opt in ("-r", "--remove"):
+            create = False
+
+    if share == "" or user == "":
+        print "Usage: " + sys.argv[0] + " --remove -n share_name -u ceph_user_id"
+        sys.exit(1)
+
+    if create == True:
+        print cephfs.create_share(share, user)    
+    else:
+        cephfs.delete_share(share, user)    
+        
+        
+if __name__ == "__main__":
+    main()
